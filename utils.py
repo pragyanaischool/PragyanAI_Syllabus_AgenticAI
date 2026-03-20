@@ -57,7 +57,7 @@ def parse_syllabus_with_ai(raw_text, filename):
     
     try:
         completion = client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": "You are a precise academic data extractor."},
                       {"role": "user", "content": prompt}],
             temperature=0.1,
@@ -86,3 +86,68 @@ def sidebar_status():
         st.sidebar.success("🏢 Industry JD Linked")
     else:
         st.sidebar.warning("⚠️ No Industry JD Linked")
+
+import streamlit as st
+from groq import Groq
+from PyPDF2 import PdfReader
+import re
+import json
+
+class SyllabusAgent:
+    def __init__(self):
+        if "PRAGYANAI_GROQ_API_KEY" not in st.secrets:
+            st.error("Please set PRAGYANAI_GROQ_API_KEY in .streamlit/secrets.toml")
+            st.stop()
+        self.client = Groq(api_key=st.secrets["PRAGYANAI_GROQ_API_KEY"])
+
+    def extract_and_clean(self, file):
+        """Extracts text and removes syllabus-specific noise (e.g., footers/headers)"""
+        reader = PdfReader(file)
+        full_text = ""
+        for page in reader.pages:
+            # Simple heuristic to skip page numbers/headers
+            lines = page.extract_text().split('\n')
+            clean_lines = [l for l in lines if not re.match(r'^\d+\s*\|\s*P\s*a\s*g\s*e', l)]
+            full_text += "\n".join(clean_lines)
+        return full_text
+
+    def agentic_parser(self, text):
+        """The 'Brain': Converts raw text into structured JSON curriculum data"""
+        prompt = f"""
+        Role: Senior Academic Auditor
+        Task: Convert this raw syllabus text into a structured JSON object.
+        
+        Strict JSON Schema:
+        {{
+          "course_code": "string",
+          "course_name": "string",
+          "credits": "int",
+          "modules": [
+            {{"id": 1, "topic": "string", "concepts": ["c1", "c2"], "hours": "int"}}
+          ],
+          "outcomes": ["string"],
+          "assessment": {{"cie": "string", "see": "string"}}
+        }}
+
+        TEXT:
+        {text[:10000]} 
+        """
+        
+        try:
+            response = self.client.chat.completions.create(
+                model="llama3-70b-8192",
+                messages=[{"role": "system", "content": "Return ONLY valid JSON."},
+                          {"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            return json.loads(response.choices[0].message.content)
+        except Exception as e:
+            st.error(f"Agent Parsing Error: {e}")
+            return None
+
+# Global Initialization Helper
+def init_agent():
+    if 'agent' not in st.session_state:
+        st.session_state.agent = SyllabusAgent()
+    if 'master_curriculum' not in st.session_state:
+        st.session_state.master_curriculum = {}
