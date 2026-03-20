@@ -1,153 +1,200 @@
+import re
+import json
 import streamlit as st
 from groq import Groq
 from PyPDF2 import PdfReader
-import re
+from typing import List, Dict
 
-import re
-def clean_syllabus_text(text):
-    # Remove common PDF artifacts and page numbers
+# =========================================
+# 1. CONFIG / CLIENT
+# =========================================
+
+class LLMClient:
+    def __init__(self):
+        api_key = st.secrets.get("PRAGYANAI_GROQ_API_KEY")
+        if not api_key:
+            st.error("Missing PRAGYANAI_GROQ_API_KEY in secrets.toml")
+            st.stop()
+
+        self.client = Groq(api_key=api_key)
+
+    def call(self, prompt: str, temperature=0) -> str:
+        try:
+            response = self.client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": "Return ONLY valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=temperature
+            )
+            return response.choices[0].message.content
+
+        except Exception as e:
+            return f"ERROR: {str(e)}"
+
+
+# =========================================
+# 2. TEXT CLEANING
+# =========================================
+
+def clean_text(text: str) -> str:
     text = re.sub(r'--- PAGE \d+ ---', '', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
-  
-# --- 1. Client Initialization ---
-def get_groq_client():
-    """Initializes the Groq client using Streamlit Secrets."""
-    if "PRAGYANAI_GROQ_API_KEY" not in st.secrets:
-        st.error("Missing GROQ_API_KEY in Streamlit Secrets! Please add it to .streamlit/secrets.toml")
-        st.stop()
-    return Groq(api_key=st.secrets["GROQ_API_KEY"])
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
-# --- 2. Text Processing & OCR ---
-def extract_text_from_pdf(uploaded_file):
-    """Extracts and cleans text from a PDF file."""
-    try:
-        reader = PdfReader(uploaded_file)
+
+# =========================================
+# 3. PDF PROCESSOR
+# =========================================
+
+class PDFProcessor:
+
+    @staticmethod
+    def extract_text(file) -> str:
+        reader = PdfReader(file)
         text = ""
+
         for page in reader.pages:
             content = page.extract_text()
             if content:
-                # Basic cleaning: remove multiple spaces and newlines
-                content = re.sub(r'\s+', ' ', content)
                 text += content + "\n"
-        return text
-    except Exception as e:
-        st.error(f"Error reading PDF: {e}")
-        return None
 
-# --- 3. Structured Extraction (The Agentic Part) ---
-def parse_syllabus_with_ai(raw_text, filename):
-    """Uses Llama-3 to convert raw text into a structured JSON-like format."""
-    client = get_groq_client()
-    
-    # Specific prompt to find Course Code and Module boundaries
-    prompt = f"""
-    Analyze the following curriculum text from the file '{filename}'.
-    Extract:
-    1. Course Title and Code (e.g., BAI654D)
-    2. Total Credits and Marks
-    3. A Module-wise breakdown (Module 1 to 5) including Main Topic and key keywords.
-    4. Course Outcomes (COs).
+        return clean_text(text)
 
-    RAW TEXT:
-    {raw_text[:8000]}  # Limiting context window for efficiency
-    
-    Return the result as a structured dictionary.
-    """
-    
-    try:
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "system", "content": "You are a precise academic data extractor."},
-                      {"role": "user", "content": prompt}],
-            temperature=0.1,
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        return f"Error in AI parsing: {e}"
+    @staticmethod
+    def chunk_text(text: str, chunk_size=4000) -> List[str]:
+        return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
-# --- 4. Shared UI Components ---
-def init_session_state():
-    """Ensures all required session keys exist across pages."""
-    if 'master_curriculum' not in st.session_state:
-        st.session_state.master_curriculum = {}
-    if 'industry_input' not in st.session_state:
-        st.session_state.industry_input = ""
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
 
-def sidebar_status():
-    """Displays a consistent status indicator in the sidebar."""
-    st.sidebar.divider()
-    st.sidebar.subheader("System Status")
-    docs_loaded = len(st.session_state.master_curriculum)
-    st.sidebar.success(f"📂 {docs_loaded} Syllabus Loaded")
-    if st.session_state.industry_input:
-        st.sidebar.success("🏢 Industry JD Linked")
-    else:
-        st.sidebar.warning("⚠️ No Industry JD Linked")
+# =========================================
+# 4. AGENTIC PARSER
+# =========================================
 
-import streamlit as st
-from groq import Groq
-from PyPDF2 import PdfReader
-import re
-import json
+class SyllabusParserAgent:
 
-class SyllabusAgent:
     def __init__(self):
-        if "PRAGYANAI_GROQ_API_KEY" not in st.secrets:
-            st.error("Please set PRAGYANAI_GROQ_API_KEY in .streamlit/secrets.toml")
-            st.stop()
-        self.client = Groq(api_key=st.secrets["PRAGYANAI_GROQ_API_KEY"])
+        self.llm = LLMClient()
 
-    def extract_and_clean(self, file):
-        """Extracts text and removes syllabus-specific noise (e.g., footers/headers)"""
-        reader = PdfReader(file)
-        full_text = ""
-        for page in reader.pages:
-            # Simple heuristic to skip page numbers/headers
-            lines = page.extract_text().split('\n')
-            clean_lines = [l for l in lines if not re.match(r'^\d+\s*\|\s*P\s*a\s*g\s*e', l)]
-            full_text += "\n".join(clean_lines)
-        return full_text
-
-    def agentic_parser(self, text):
-        """The 'Brain': Converts raw text into structured JSON curriculum data"""
+    def parse_chunk(self, chunk: str) -> Dict:
         prompt = f"""
-        Role: Senior Academic Auditor
-        Task: Convert this raw syllabus text into a structured JSON object.
-        
-        Strict JSON Schema:
+        Extract structured syllabus data.
+
+        Return JSON:
         {{
-          "course_code": "string",
-          "course_name": "string",
-          "credits": "int",
+          "course_code": "",
+          "course_name": "",
           "modules": [
-            {{"id": 1, "topic": "string", "concepts": ["c1", "c2"], "hours": "int"}}
+            {{"id": 1, "topic": "", "concepts": [], "hours": 0}}
           ],
-          "outcomes": ["string"],
-          "assessment": {{"cie": "string", "see": "string"}}
+          "outcomes": []
         }}
 
         TEXT:
-        {text[:10000]} 
+        {chunk}
         """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model="llama3-70b-8192",
-                messages=[{"role": "system", "content": "Return ONLY valid JSON."},
-                          {"role": "user", "content": prompt}],
-                response_format={"type": "json_object"}
-            )
-            return json.loads(response.choices[0].message.content)
-        except Exception as e:
-            st.error(f"Agent Parsing Error: {e}")
-            return None
 
-# Global Initialization Helper
-def init_agent():
-    if 'agent' not in st.session_state:
-        st.session_state.agent = SyllabusAgent()
-    if 'master_curriculum' not in st.session_state:
-        st.session_state.master_curriculum = {}
+        raw_output = self.llm.call(prompt)
+        return self.safe_json(raw_output)
+
+    def safe_json(self, text: str) -> Dict:
+        try:
+            return json.loads(text)
+        except:
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except:
+                    return {}
+        return {}
+
+
+# =========================================
+# 5. MERGER + VALIDATOR AGENT
+# =========================================
+
+class SyllabusValidator:
+
+    @staticmethod
+    def merge(results: List[Dict]) -> Dict:
+        merged = {
+            "course_code": "",
+            "course_name": "",
+            "modules": [],
+            "outcomes": []
+        }
+
+        for r in results:
+            if not r:
+                continue
+
+            merged["course_code"] = merged["course_code"] or r.get("course_code")
+            merged["course_name"] = merged["course_name"] or r.get("course_name")
+
+            merged["modules"].extend(r.get("modules", []))
+            merged["outcomes"].extend(r.get("outcomes", []))
+
+        return merged
+
+    @staticmethod
+    def deduplicate_modules(modules: List[Dict]) -> List[Dict]:
+        seen = set()
+        unique = []
+
+        for m in modules:
+            key = m.get("topic")
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(m)
+
+        return unique
+
+    @staticmethod
+    def validate(data: Dict) -> Dict:
+        if not data:
+            return {}
+
+        data["modules"] = SyllabusValidator.deduplicate_modules(
+            data.get("modules", [])
+        )
+
+        return data
+
+
+# =========================================
+# 6. MAIN SERVICE PIPELINE
+# =========================================
+
+class SyllabusService:
+
+    def __init__(self):
+        self.parser = SyllabusParserAgent()
+        self.validator = SyllabusValidator()
+
+    def process(self, file) -> Dict:
+        raw_text = PDFProcessor.extract_text(file)
+        chunks = PDFProcessor.chunk_text(raw_text)
+
+        parsed_results = []
+
+        for chunk in chunks:
+            parsed = self.parser.parse_chunk(chunk)
+            parsed_results.append(parsed)
+
+        merged = self.validator.merge(parsed_results)
+        validated = self.validator.validate(merged)
+
+        return validated
+
+
+# =========================================
+# 7. SESSION INIT (UI SHOULD IMPORT THIS)
+# =========================================
+
+def init_session():
+    if "service" not in st.session_state:
+        st.session_state.service = SyllabusService()
+
+    if "curriculum" not in st.session_state:
+        st.session_state.curriculum = {}
